@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { supabase } from "./supabase";
 
 const DEFAULT_PROJECTS = [
   "Gutter/flashing repair",
@@ -39,7 +40,7 @@ const DEFAULT_PROJECTS = [
 ];
 
 const PEOPLE = ["Nate", "Amanda"];
-const STORAGE_KEY = "house-project-priority-board-v3";
+const STORAGE_KEY = "house-project-priority-board-v4";
 const DEFAULT_RATING = 3;
 const BOARD_PADDING_PCT = 6;
 
@@ -142,33 +143,108 @@ function getClusterOffsets(index, total, radius = 14) {
   };
 }
 
-export default function HouseProjectPriorityApp() {
-  const [projects, setProjects] = useState(() => {
-    if (typeof window === "undefined") return getInitialProjects();
-    const saved = window.localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return parsed.map((project) => ({
-          ...project,
-          touched: project.touched ?? { Nate: true, Amanda: true },
-        }));
-      } catch {
-        return getInitialProjects();
-      }
-    }
-    return getInitialProjects();
-  });
+function normalizeProjectRow(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    status: row.status ?? "active",
+    ratings: row.ratings ?? {
+      Nate: { effort: DEFAULT_RATING, impact: DEFAULT_RATING },
+      Amanda: { effort: DEFAULT_RATING, impact: DEFAULT_RATING },
+    },
+    touched: row.touched ?? { Nate: false, Amanda: false },
+    createdAt: row.created_at ?? Date.now(),
+  };
+}
 
+function projectToRow(project) {
+  return {
+    id: project.id,
+    name: project.name,
+    status: project.status,
+    ratings: project.ratings,
+    touched: project.touched,
+    created_at: project.createdAt,
+  };
+}
+
+export default function HouseProjectPriorityApp() {
+  const [projects, setProjects] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [activeTab, setActiveTab] = useState("active");
   const [currentPerson, setCurrentPerson] = useState("Nate");
   const [newProjectName, setNewProjectName] = useState("");
   const [search, setSearch] = useState("");
+  const [isLoaded, setIsLoaded] = useState(false);
 
   useEffect(() => {
+    async function loadProjects() {
+      const { data, error } = await supabase
+        .from("projects")
+        .select("*")
+        .order("created_at", { ascending: true });
+
+      if (error) {
+        console.error("Supabase load failed:", error);
+        const saved = window.localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          try {
+            setProjects(JSON.parse(saved));
+          } catch {
+            setProjects(getInitialProjects());
+          }
+        } else {
+          setProjects(getInitialProjects());
+        }
+        setIsLoaded(true);
+        return;
+      }
+
+      if (!data || data.length === 0) {
+        const starter = getInitialProjects();
+        setProjects(starter);
+
+        const { error: seedError } = await supabase
+          .from("projects")
+          .upsert(starter.map(projectToRow));
+
+        if (seedError) {
+          console.error("Supabase seed failed:", seedError);
+        }
+      } else {
+        setProjects(data.map(normalizeProjectRow));
+      }
+
+      setIsLoaded(true);
+    }
+
+    loadProjects();
+  }, []);
+
+  useEffect(() => {
+    if (!isLoaded) return;
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(projects));
-  }, [projects]);
+  }, [projects, isLoaded]);
+
+  async function saveProjects(updatedProjects) {
+    setProjects(updatedProjects);
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedProjects));
+
+    const { error } = await supabase
+      .from("projects")
+      .upsert(updatedProjects.map(projectToRow));
+
+    if (error) {
+      console.error("Supabase save failed:", error);
+    }
+  }
+
+  async function deleteProjectFromSupabase(id) {
+    const { error } = await supabase.from("projects").delete().eq("id", id);
+    if (error) {
+      console.error("Supabase delete failed:", error);
+    }
+  }
 
   const activeProjects = useMemo(() => projects.filter((p) => p.status === "active"), [projects]);
   const completedProjects = useMemo(() => projects.filter((p) => p.status === "completed"), [projects]);
@@ -207,51 +283,62 @@ export default function HouseProjectPriorityApp() {
 
   function updateRating(person, field, value) {
     if (!selectedProject) return;
-    setProjects((current) =>
-      current.map((p) =>
-        p.id === selectedProject.id
-          ? {
-              ...p,
-              ratings: {
-                ...p.ratings,
-                [person]: {
-                  ...p.ratings[person],
-                  [field]: Number(value),
-                },
+
+    const updated = projects.map((p) =>
+      p.id === selectedProject.id
+        ? {
+            ...p,
+            ratings: {
+              ...p.ratings,
+              [person]: {
+                ...p.ratings[person],
+                [field]: Number(value),
               },
-              touched: {
-                ...p.touched,
-                [person]: true,
-              },
-            }
-          : p
-      )
+            },
+            touched: {
+              ...p.touched,
+              [person]: true,
+            },
+          }
+        : p
     );
+
+    saveProjects(updated);
   }
 
   function addProject() {
     const trimmed = newProjectName.trim();
     if (!trimmed) return;
+
     const project = makeProject(trimmed, projects.length);
-    setProjects((p) => [...p, project]);
+    const updated = [...projects, project];
+    saveProjects(updated);
     setSelectedId(project.id);
     setNewProjectName("");
     setActiveTab("active");
   }
 
   function markCompleted(id) {
-    setProjects((p) => p.map((pr) => (pr.id === id ? { ...pr, status: "completed" } : pr)));
+    const updated = projects.map((pr) =>
+      pr.id === id ? { ...pr, status: "completed" } : pr
+    );
+    saveProjects(updated);
     if (selectedId === id) setSelectedId(null);
   }
 
   function restoreProject(id) {
-    setProjects((p) => p.map((pr) => (pr.id === id ? { ...pr, status: "active" } : pr)));
+    const updated = projects.map((pr) =>
+      pr.id === id ? { ...pr, status: "active" } : pr
+    );
+    saveProjects(updated);
     setSelectedId(id);
     setActiveTab("active");
   }
 
   function deleteProject(id) {
-    setProjects((p) => p.filter((pr) => pr.id !== id));
+    const updated = projects.filter((pr) => pr.id !== id);
+    saveProjects(updated);
+    deleteProjectFromSupabase(id);
     if (selectedId === id) setSelectedId(null);
   }
 
@@ -265,7 +352,7 @@ export default function HouseProjectPriorityApp() {
     if (fallback) setSelectedId(fallback.id);
   }
 
-  function resetAll() {
+  async function resetAll() {
     const fresh = getInitialProjects();
     setProjects(fresh);
     setSelectedId(null);
@@ -273,10 +360,23 @@ export default function HouseProjectPriorityApp() {
     setCurrentPerson("Nate");
     setNewProjectName("");
     setSearch("");
+
+    await supabase.from("projects").delete().neq("id", "");
+    await supabase.from("projects").upsert(fresh.map(projectToRow));
   }
 
   const avg = selectedProject ? averageRatings(selectedProject) : null;
   const nextUnratedExists = rankedActiveProjects.some((project) => isUnratedByPerson(project, currentPerson));
+
+  if (!isLoaded) {
+    return (
+      <div className="min-h-screen bg-slate-100 p-6">
+        <div className="mx-auto max-w-3xl rounded-3xl border bg-white p-8 shadow-sm">
+          <h1 className="text-2xl font-bold">Loading house project board...</h1>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-100 p-4 md:p-6">
@@ -645,9 +745,9 @@ export default function HouseProjectPriorityApp() {
         </div>
 
         <div className="rounded-3xl border bg-white p-5 shadow-sm">
-          <h2 className="text-lg font-semibold">What to expect next</h2>
+          <h2 className="text-lg font-semibold">Sync status</h2>
           <p className="mt-2 text-sm text-slate-600">
-            This version stores data in the current browser only. Once you like the look and behavior, the next real step is wiring it to Supabase so you and Amanda see the same project data from different devices.
+            This version saves to Supabase, so you and Amanda can use the same shared board from different devices.
           </p>
         </div>
       </div>
