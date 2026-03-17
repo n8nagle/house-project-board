@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./supabase";
 
 const DEFAULT_PROJECTS = [
@@ -168,6 +168,54 @@ function projectToRow(project) {
   };
 }
 
+function isValidImportedProject(project) {
+  return (
+    project &&
+    typeof project.id === "string" &&
+    typeof project.name === "string" &&
+    typeof project.status === "string" &&
+    project.ratings &&
+    project.touched
+  );
+}
+
+function mergeImportedProjects(currentProjects, importedProjects) {
+  const currentMap = new Map(currentProjects.map((project) => [project.id, project]));
+  const importedMap = new Map(
+    importedProjects
+      .filter(isValidImportedProject)
+      .map((project) => [
+        project.id,
+        {
+          id: project.id,
+          name: project.name,
+          status: project.status ?? "active",
+          ratings: project.ratings ?? {
+            Nate: { effort: DEFAULT_RATING, impact: DEFAULT_RATING },
+            Amanda: { effort: DEFAULT_RATING, impact: DEFAULT_RATING },
+          },
+          touched: project.touched ?? {
+            Nate: false,
+            Amanda: false,
+          },
+          createdAt: project.createdAt ?? Date.now(),
+        },
+      ])
+  );
+
+  const merged = currentProjects.map((project) =>
+    importedMap.has(project.id) ? importedMap.get(project.id) : project
+  );
+
+  importedMap.forEach((project, id) => {
+    if (!currentMap.has(id)) {
+      merged.push(project);
+    }
+  });
+
+  return merged;
+}
+
 export default function HouseProjectPriorityApp() {
   const [projects, setProjects] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -176,6 +224,7 @@ export default function HouseProjectPriorityApp() {
   const [newProjectName, setNewProjectName] = useState("");
   const [search, setSearch] = useState("");
   const [isLoaded, setIsLoaded] = useState(false);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     async function loadProjects() {
@@ -243,6 +292,31 @@ export default function HouseProjectPriorityApp() {
     const { error } = await supabase.from("projects").delete().eq("id", id);
     if (error) {
       console.error("Supabase delete failed:", error);
+    }
+  }
+
+  async function handleImportFile(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+
+      if (!Array.isArray(parsed)) {
+        alert("That file is not a valid project export.");
+        return;
+      }
+
+      const mergedProjects = mergeImportedProjects(projects, parsed);
+      await saveProjects(mergedProjects);
+
+      alert("Projects imported successfully.");
+    } catch (error) {
+      console.error("Import failed:", error);
+      alert("Import failed. Check that the JSON file is valid.");
+    } finally {
+      event.target.value = "";
     }
   }
 
@@ -388,12 +462,28 @@ export default function HouseProjectPriorityApp() {
               <p className="mt-2 text-slate-600">Effort increases to the right. Impact increases upward.</p>
             </div>
             <div className="flex flex-wrap gap-3">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".json,application/json"
+                onChange={handleImportFile}
+                className="hidden"
+              />
+
               <button
                 onClick={() => exportData(projects)}
                 className="rounded-2xl bg-slate-200 px-4 py-2 font-medium transition hover:bg-slate-300"
               >
                 Export JSON
               </button>
+
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="rounded-2xl bg-sky-100 px-4 py-2 font-medium transition hover:bg-sky-200"
+              >
+                Import JSON
+              </button>
+
               <button
                 onClick={resetAll}
                 className="rounded-2xl bg-rose-100 px-4 py-2 font-medium transition hover:bg-rose-200"
